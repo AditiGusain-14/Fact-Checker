@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Environment variables
+.env
+
+# VS Code
+.vscode/
+
+# Mac / Windows system files
+.DS_Store
+Thumbs.db

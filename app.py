@@ -3,7 +3,8 @@ import fitz
 import pandas as pd
 import json
 import re
-import ollama
+import requests
+from duckduckgo_search import DDGS
 from datetime import datetime
 
 # ==================================================
@@ -17,44 +18,84 @@ st.set_page_config(
 )
 
 # ==================================================
+# HUGGING FACE CONFIG
+# ==================================================
+
+HF_TOKEN = st.secrets["HF_TOKEN"]
+
+API_URL = "https://api-inference.huggingface.co/models/google/flan-t5-large"
+
+headers = {
+    "Authorization": f"Bearer {HF_TOKEN}"
+}
+
+# ==================================================
 # CUSTOM CSS
 # ==================================================
 
 st.markdown("""
 <style>
 
-    .stApp {
-        background-color: #f5f7fb;
-        font-family: 'Inter', sans-serif;
-    }
+.stApp {
+    background-color: #f5f7fb;
+    font-family: 'Inter', sans-serif;
+}
 
-    .main-title {
-        font-size: 3rem;
-        font-weight: 700;
-        color: #111827;
-        margin-bottom: 0.5rem;
-    }
+.main-title {
+    font-size: 3rem;
+    font-weight: 700;
+    color: #111827;
+}
 
-    .sub-text {
-        font-size: 1.05rem;
-        color: #6b7280;
-        line-height: 1.8;
-    }
+.sub-text {
+    color: #6b7280;
+    font-size: 1.05rem;
+    line-height: 1.8;
+}
 
-    .small-heading {
-        font-size: 1.2rem;
-        font-weight: 600;
-        color: #111827;
-        margin-bottom: 1rem;
-    }
+.small-heading {
+    font-size: 1.2rem;
+    font-weight: 600;
+    margin-bottom: 1rem;
+}
 
 </style>
 """, unsafe_allow_html=True)
 
 # ==================================================
-# PDF TEXT EXTRACTION
+# HUGGING FACE QUERY
 # ==================================================
 
+def query_huggingface(prompt):
+
+    payload = {
+        "inputs": prompt
+    }
+
+    response = requests.post(
+        API_URL,
+        headers=headers,
+        json=payload,
+        timeout=60
+    )
+
+    try:
+
+        output = response.json()
+
+        if isinstance(output, list):
+
+            return output[0]["generated_text"]
+
+        return str(output)
+
+    except:
+
+        return ""
+
+# ==================================================
+# PDF EXTRACTION
+# ==================================================
 
 def extract_text_from_pdf(uploaded_file):
 
@@ -69,130 +110,311 @@ def extract_text_from_pdf(uploaded_file):
 
         page = pdf_document.load_page(page_num)
 
-        text = page.get_text("text")  # type: ignore[attr-defined]
+        text = page.get_text("text")  # type: ignore
 
-        full_text += f"\n\n--- PAGE {page_num + 1} ---\n\n"
         full_text += text
 
     return full_text
 
-
 # ==================================================
-# CLAIM EXTRACTION USING OLLAMA
+# CLAIM EXTRACTION
 # ==================================================
-
 
 def extract_claims(text):
 
-    prompt = f"""
-    Extract factual claims from this document.
+    claims = []
 
-    Only extract:
-    - statistics
-    - percentages
-    - financial figures
-    - dates
-    - technical claims
+    sentences = re.split(r'(?<=[.!?])\s+', text)
 
-    Return ONLY a Python list.
-
-    Example:
-
-    [
-        "OpenAI was founded in 2015.",
-        "The AI market reached $50 billion in 2023."
+    patterns = [
+        r'\d+%',
+        r'\$\d+',
+        r'\d{4}',
+        r'\d+\s?(million|billion|trillion)',
+        r'\d+\.\d+'
     ]
 
-    DOCUMENT:
-    {text[:5000]}
-    """
+    for sentence in sentences:
 
-    response = ollama.chat(
-        model='gemma:2b',
-        messages=[
-            {
-                'role': 'user',
-                'content': prompt
-            }
-        ]
-    )
+        for pattern in patterns:
 
-    claims_text = response['message']['content']
+            if re.search(pattern, sentence, re.IGNORECASE):
+
+                claims.append(sentence.strip())
+
+                break
+
+    unique_claims = list(set(claims))
+
+    return unique_claims[:10]
+
+# ==================================================
+# LIVE WEB SEARCH
+# ==================================================
+
+def search_web(claim):
 
     try:
 
-        claims = eval(claims_text)
+        with DDGS() as ddgs:
 
-        if isinstance(claims, list):
-            return claims[:15]
+            results = list(
+                ddgs.text(
+                    claim,
+                    max_results=5
+                )
+            )
+
+        snippets = []
+
+        for result in results:
+
+            snippets.append(
+                result.get("body", "")
+            )
+
+        return " ".join(snippets)
 
     except:
-        pass
 
-    return []
-
+        return ""
 
 # ==================================================
-# FACT CHECKING USING OLLAMA
+# KEYWORD OVERLAP SCORE
+# Measures how many meaningful words from the claim
+# appear in the web evidence (0.0 to 1.0)
 # ==================================================
 
+def keyword_overlap_score(claim, evidence):
+
+    if not evidence:
+        return 0.0
+
+    stopwords = {
+        "the", "a", "an", "in", "of", "and", "to", "is",
+        "was", "were", "it", "that", "for", "on", "at",
+        "by", "with", "from", "has", "have", "had", "be",
+        "its", "are", "this", "as", "or", "but", "not"
+    }
+
+    claim_words = set(
+        w.lower()
+        for w in re.findall(r'\b\w+\b', claim)
+        if w.lower() not in stopwords and len(w) > 2
+    )
+
+    evidence_words = set(
+        w.lower()
+        for w in re.findall(r'\b\w+\b', evidence)
+    )
+
+    if not claim_words:
+        return 0.0
+
+    overlap = claim_words & evidence_words
+
+    return len(overlap) / len(claim_words)
+
+# ==================================================
+# CONTRADICTION DETECTION
+# Looks for explicit contradicting numbers/years in
+# the evidence that differ from the claim's values
+# ==================================================
+
+def detect_contradiction(claim, evidence):
+
+    if not evidence:
+        return False
+
+    # Extract years from claim
+    claim_years = re.findall(r'\b((?:19|20)\d{2})\b', claim)
+
+    # Extract large numbers (millions/billions) from claim
+    claim_magnitudes = re.findall(
+        r'\$?([\d,]+(?:\.\d+)?)\s*(million|billion|trillion)',
+        claim, re.IGNORECASE
+    )
+
+    # Extract plain percentages from claim
+    claim_pcts = re.findall(r'(\d+(?:\.\d+)?)%', claim)
+
+    # --- Year contradiction ---
+    for year in claim_years:
+
+        ev_years = re.findall(r'\b((?:19|20)\d{2})\b', evidence)
+
+        if ev_years and year not in ev_years:
+            return True
+
+    # --- Magnitude contradiction ---
+    for value, unit in claim_magnitudes:
+
+        value_clean = value.replace(",", "")
+
+        pattern = rf'([\d,]+(?:\.\d+)?)\s*{unit}'
+        ev_magnitudes = re.findall(pattern, evidence.lower(), re.IGNORECASE)
+
+        if ev_magnitudes:
+
+            ev_values = [float(v.replace(",", "")) for v in ev_magnitudes]
+            claim_val = float(value_clean)
+
+            all_differ = all(
+                abs(ev - claim_val) / max(claim_val, 1) > 0.20
+                for ev in ev_values
+            )
+
+            if all_differ:
+                return True
+
+    # --- Percentage contradiction ---
+    for pct in claim_pcts:
+
+        ev_pcts = re.findall(r'(\d+(?:\.\d+)?)%', evidence)
+
+        if ev_pcts:
+
+            ev_floats = [float(p) for p in ev_pcts]
+            claim_float = float(pct)
+
+            all_differ = all(
+                abs(ev - claim_float) / max(claim_float, 1) > 0.20
+                for ev in ev_floats
+            )
+
+            if all_differ:
+                return True
+
+    return False
+
+# ==================================================
+# CLAIM CLEANER
+# Strips label prefixes that leak into extracted
+# claims and pollute search queries
+# ==================================================
+
+def clean_claim(claim):
+
+    prefixes = [
+        "Verified",
+        "False",
+        "Inaccurate",
+        "Financial",
+        "Statistical",
+        "Type",
+        "Claim"
+    ]
+
+    cleaned = claim
+
+    for prefix in prefixes:
+
+        cleaned = cleaned.replace(prefix, "")
+
+    return cleaned.strip()
+
+# ==================================================
+# FACT CHECKING
+# ==================================================
 
 def verify_claim(claim):
 
-    prompt = f"""
-    You are a professional AI fact-checker.
+    web_evidence = search_web(claim)
 
-    Analyze the following claim.
+    # --------------------------------------------------
+    # CLASSIFICATION LOGIC
+    #
+    # 1. No evidence returned            → False / Low
+    # 2. Evidence contradicts numbers
+    #    or years in the claim           → False / High
+    # 3. Evidence found, no contradiction,
+    #    good keyword overlap (>= 0.45)  → Verified / High
+    # 4. Some overlap but not enough
+    #    to fully confirm (0.20–0.44)    → Inaccurate / Medium
+    # 5. Very low overlap (< 0.20)       → False / Low
+    # --------------------------------------------------
 
-    Classify it as:
-    - Verified
-    - Inaccurate
-    - False
+    if not web_evidence.strip():
 
-    Also provide:
-    - confidence percentage
-    - corrected fact
-    - short explanation
+        status     = "False"
+        confidence = "Low"
 
-    Return ONLY valid JSON.
+    else:
 
-    Example:
+        contradiction = detect_contradiction(claim, web_evidence)
+        overlap       = keyword_overlap_score(claim, web_evidence)
 
-    {{
-        "status": "Verified",
-        "confidence": "92%",
-        "fact": "OpenAI was founded in 2015.",
-        "source": "Public trusted information"
-    }}
+        if contradiction:
 
-    CLAIM:
-    {claim}
-    """
+            status     = "False"
+            confidence = "High"
 
-    response = ollama.chat(
-        model='gemma:2b',
-        messages=[
-            {
-                'role': 'user',
-                'content': prompt
-            }
-        ]
+        elif overlap >= 0.45:
+
+            status     = "Verified"
+            confidence = "High"
+
+        elif overlap >= 0.20:
+
+            status     = "Inaccurate"
+            confidence = "Medium"
+
+        else:
+
+            status     = "False"
+            confidence = "Low"
+
+    # ==============================================
+    # GENERATE CORRECT FACT FROM WEB EVIDENCE
+    # Pull the first substantive sentence directly
+    # from evidence — no model formatting required
+    # ==============================================
+
+    evidence_sentences = re.split(
+        r'(?<=[.!?])\s+',
+        web_evidence
     )
 
-    result_text = response['message']['content']
+    correct_fact = ""
 
-    try:
-        return json.loads(result_text)
+    for sentence in evidence_sentences:
 
-    except:
+        if len(sentence.strip()) > 40:
 
-        return {
-            "status": "Inaccurate",
-            "confidence": "60%",
-            "fact": "Unable to verify confidently.",
-            "source": "Local AI verification"
-        }
+            correct_fact = sentence.strip()
 
+            break
+
+    if not correct_fact:
+
+        correct_fact = web_evidence[:200]
+
+    # ==============================================
+    # AI EXPLANATION
+    # Model only generates a short explanation —
+    # no structured formatting required
+    # ==============================================
+
+    prompt = f"""
+Explain briefly why this claim is {status}.
+CLAIM:
+{claim}
+CORRECT FACT:
+{correct_fact}
+Keep explanation under 2 sentences.
+"""
+
+    reason = query_huggingface(prompt)
+
+    source_preview = "DuckDuckGo Live Search"
+
+    return {
+        "status":     status,
+        "confidence": confidence,
+        "fact":       correct_fact,
+        "reason":     reason,
+        "source":     source_preview
+    }
 
 # ==================================================
 # HEADER
@@ -206,16 +428,16 @@ st.markdown(
 st.markdown(
     '''
     <div class="sub-text">
-    Upload a PDF document and automatically verify factual claims using AI-powered extraction and local AI verification.
+    Upload a PDF document and automatically verify factual claims using live web evidence and AI reasoning.
     <br><br>
-    The system identifies:
+    The system:
     <ul>
-        <li>Outdated statistics</li>
-        <li>Fake numerical claims</li>
-        <li>Unsupported information</li>
-        <li>Misinformation</li>
+        <li>Extracts statistical and factual claims</li>
+        <li>Searches live web sources</li>
+        <li>Compares claim vs evidence</li>
+        <li>Detects contradictions automatically</li>
+        <li>Provides corrected factual information</li>
     </ul>
-    and provides corrected facts with verification status.
     </div>
     ''',
     unsafe_allow_html=True
@@ -224,19 +446,19 @@ st.markdown(
 st.write("")
 
 # ==================================================
-# STATUS INDICATORS
+# STATUS CARDS
 # ==================================================
 
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    st.success("✅ Verified Claims")
+    st.success("✅ Verified")
 
 with col2:
-    st.warning("⚠️ Inaccurate Claims")
+    st.warning("⚠️ Inaccurate")
 
 with col3:
-    st.error("❌ False Claims")
+    st.error("❌ False")
 
 st.divider()
 
@@ -282,11 +504,15 @@ with left_col:
         st.markdown("""
         1. Extract text from PDF
 
-        2. Extract factual claims using Gemma 2B
+        2. Detect factual/statistical claims
 
-        3. Verify claims using local AI reasoning
+        3. Search live web evidence
 
-        4. Generate final fact-check report
+        4. Compare claims vs evidence
+
+        5. Detect contradictions
+
+        6. Generate AI explanations
         """)
 
         analyze_btn = st.button(
@@ -307,14 +533,16 @@ with left_col:
 
                 for claim in claims:
 
+                    claim = clean_claim(claim)
+
                     verification = verify_claim(claim)
 
                     results.append({
-                        "Claim": claim,
-                        "Status": verification.get("status", "Unknown"),
-                        "Confidence": verification.get("confidence", "0%"),
-                        "Correct Fact": verification.get("fact", "No fact available"),
-                        "Source": verification.get("source", "No source")
+                        "Claim":        claim,
+                        "Status":       verification["status"],
+                        "Confidence":   verification["confidence"],
+                        "Correct Fact": verification["fact"],
+                        "Source":       verification["source"]
                     })
 
                 st.session_state["results"] = results
@@ -333,29 +561,17 @@ with right_col:
     )
 
     st.info("""
-    Step 1: Upload your PDF
+    Step 1: Upload PDF
 
-    Step 2: Gemma 2B extracts factual claims
+    Step 2: Extract Claims
 
-    Step 3: Local AI verifies claims
+    Step 3: Search Live Web
 
-    Step 4: Final report is generated
-    """)
+    Step 4: Compare Facts
 
-    st.write("")
+    Step 5: AI Explanation
 
-    st.markdown(
-        '<div class="small-heading">Supported Claims</div>',
-        unsafe_allow_html=True
-    )
-
-    st.markdown("""
-    - Statistics & Percentages
-    - Financial Figures
-    - Dates & Historical Facts
-    - Market Reports
-    - Technical Statements
-    - Growth Metrics
+    Step 6: Generate Report
     """)
 
     st.write("")
@@ -366,15 +582,15 @@ with right_col:
     )
 
     st.markdown("""
-    - Ollama
-    - Gemma 2B
+    - Hugging Face API
+    - DuckDuckGo Search
+    - Flan-T5-Large
     - PyMuPDF
     - Streamlit
-    - Local AI Verification
     """)
 
 # ==================================================
-# RESULTS SECTION
+# RESULTS
 # ==================================================
 
 if "results" in st.session_state:
@@ -383,7 +599,9 @@ if "results" in st.session_state:
 
     st.subheader("📊 Fact-Checking Results")
 
-    results_df = pd.DataFrame(st.session_state["results"])
+    results_df = pd.DataFrame(
+        st.session_state["results"]
+    )
 
     st.dataframe(
         results_df,
@@ -406,22 +624,22 @@ if "results" in st.session_state:
         for r in st.session_state["results"]
     )
 
-    metric1, metric2, metric3 = st.columns(3)
+    col1, col2, col3 = st.columns(3)
 
-    metric1.metric("Verified", verified_count)
-    metric2.metric("Inaccurate", inaccurate_count)
-    metric3.metric("False", false_count)
+    col1.metric("Verified", verified_count)
+    col2.metric("Inaccurate", inaccurate_count)
+    col3.metric("False", false_count)
 
     st.write("")
 
-    json_report = json.dumps(
+    report_json = json.dumps(
         st.session_state["results"],
         indent=4
     )
 
     st.download_button(
         label="Download Report",
-        data=json_report,
+        data=report_json,
         file_name="fact_check_report.json",
         mime="application/json",
         use_container_width=True
@@ -434,5 +652,5 @@ if "results" in st.session_state:
 st.divider()
 
 st.caption(
-    "Built with Streamlit • Ollama • Gemma 2B • Local AI Fact Verification"
+    "Built with Streamlit • Hugging Face • DuckDuckGo • AI Fact Verification"
 )
